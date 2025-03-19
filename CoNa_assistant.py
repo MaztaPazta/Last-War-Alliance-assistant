@@ -34,6 +34,10 @@ class GridApp:
         self.load_alliance_members()  # NEW: load alliance members from file
         self.predefined_vs_tasks = ["Daily Check", "System Update", "Report Generation"]
 
+        self.friendly_objects = {"1": "#145A32", "2": "#1E8449", "3": "#28B463", "4": "#52BE80", "5": "#82E0AA"}
+        self.enemy_objects    = {"1": "#922B21", "2": "#A93226", "3": "#C0392B", "4": "#E74C3C", "5": "#F1948A"}
+        self.other_objects    = {"MG": "#FF5733"}
+
         # Schedule data: each day will have two fixed items: Conductor and VS.
         self.conductor_assignments = {}  # e.g., {"2025-03-18": "Alice", ...}
         self.vs_tasks = {}               # e.g., {"2025-03-18": ["Task 1", "Task 2"], ...}
@@ -49,6 +53,29 @@ class GridApp:
         self.placed_objects = {}
         self.terrain_cells = {}
 
+        # For multi-selection and moving:
+        self.selected_objects = set()          # Stores keys (e.g., (x,y)) of selected objects
+        self.selected_markers = set()          # NEW: For marker selection
+        self.marker_dragging = False           # NEW: To track if a marker is being dragged
+        self.selection_rect = None             # Canvas item id for the rubberband rectangle
+        self.selection_start = None            # Starting point for rectangle selection (canvas coords)
+        self.moving_start = None               # Starting point for moving (canvas coords)
+        self.original_positions = {}           # Dictionary mapping object keys to their original (x,y) positions when moving
+        self.selected_tool = None
+        self.original_positions = {}  # Dictionary mapping object keys to their original positions when moving
+        
+        # For markers (a dictionary keyed by a unique marker ID, e.g. the marker's name)
+        self.markers = {}  # Each marker is a dict with keys: "name", "x1", "y1", "x2", "y2", "color"
+
+        # For marker moving/resizing:
+        self.current_marker_id = None   # The marker (its key) currently being moved/resized
+        self.marker_move_start = None   # The canvas coordinate where the marker drag started
+        self.marker_resizing = False    # Flag: True if the user is resizing (dragging a corner)
+        self.current_tool = None  # Normal, or "marker_draw" when drawing a marker
+        self.marker_draw_start = None  # Canvas (pixel) coordinate where marker drawing starts
+        self.marker_draw_rect = None   # The canvas item id for the temporary rectangle
+        self.marker_snap_dot_id = None  # canvas item for the little "snap" dot
+
         # Load textures for terrain
         self.load_textures()
 
@@ -57,6 +84,19 @@ class GridApp:
 
         # Create UI elements
         self.create_ui()
+    
+        # Marker-drawing bindings
+        self.canvas.bind("<ButtonPress-1>", self.marker_draw_press, add="+")
+        self.canvas.bind("<B1-Motion>", self.marker_draw_motion, add="+")
+        self.canvas.bind("<ButtonRelease-1>", self.marker_draw_release, add="+")
+
+        # Then bind the general handlers once.
+        self.canvas.bind("<ButtonPress-1>", self.on_left_button_press)
+        self.canvas.bind("<B1-Motion>", self.on_left_button_motion)
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_button_release)
+
+
+        self.root.bind("<Delete>", self.delete_selected_objects)
 
         # Load saved state and start autosave loop
         self.load_state()
@@ -194,7 +234,42 @@ class GridApp:
         else:
             self.coord_label.config(text="Coordinates: Out of Bounds")
         self.update_shadow(event)
-        
+        if self.current_tool == "marker_draw":
+            # Convert the cursor's canvas position → nearest grid corner
+            canvas_x = self.canvas.canvasx(event.x)
+            canvas_y = self.canvas.canvasy(event.y)
+            adjusted = CELL_SIZE * self.zoom_factor
+
+            # 1) Convert canvas → grid corner, rounding to nearest integer
+            grid_x = round((canvas_x - self.pan_x) / adjusted)
+            grid_y = round(GRID_SIZE - (canvas_y - self.pan_y) / adjusted - 1)
+
+            # 2) Convert that grid corner back → canvas coords
+            dot_cx = grid_x * adjusted + self.pan_x
+            dot_cy = (GRID_SIZE - grid_y) * adjusted + self.pan_y
+
+            # If the dot doesn't exist yet, create it:
+            if self.marker_snap_dot_id is None:
+                r = 4  # radius of the dot in pixels
+                self.marker_snap_dot_id = self.canvas.create_oval(
+                    dot_cx - r, dot_cy - r,
+                    dot_cx + r, dot_cy + r,
+                    fill="red", outline=""
+                )
+            else:
+                # Otherwise, just move the existing dot
+                r = 4
+                self.canvas.coords(
+                    self.marker_snap_dot_id,
+                    dot_cx - r, dot_cy - r,
+                    dot_cx + r, dot_cy + r
+                )
+        else:
+            # If we’re NOT in marker-draw mode, remove the dot if it exists
+            if self.marker_snap_dot_id is not None:
+                self.canvas.delete(self.marker_snap_dot_id)
+                self.marker_snap_dot_id = None
+            
     def set_start_position(self, x, y):
         self.pan_x = -x * CELL_SIZE * self.zoom_factor + 400
         self.pan_y = -(GRID_SIZE - y - 1) * CELL_SIZE * self.zoom_factor + 400
@@ -234,6 +309,7 @@ class GridApp:
         state = {
             "placed_objects": {f"{x},{y}": data for (x, y), data in self.placed_objects.items()},
             "terrain_cells": {f"{x},{y}": terrain for (x, y), terrain in self.terrain_cells.items()},
+            "markers": self.markers,  # <-- added markers
             "pan_x": self.pan_x,
             "pan_y": self.pan_y,
             "zoom_factor": self.zoom_factor
@@ -253,6 +329,7 @@ class GridApp:
             for key, terrain in state.get("terrain_cells", {}).items():
                 x, y = map(int, key.split(","))
                 self.terrain_cells[(x, y)] = terrain
+            self.markers = state.get("markers", {})  # <-- load markers
             self.pan_x = state.get("pan_x", self.pan_x)
             self.pan_y = state.get("pan_y", self.pan_y)
             self.zoom_factor = state.get("zoom_factor", self.zoom_factor)
@@ -279,13 +356,6 @@ class GridApp:
             for date in sorted(self.conductor_assignments.keys()):
                 f.write(f"{date}: {self.conductor_assignments[date]}\n")
 
-    def toggle_delete_mode(self):
-        if self.selected_tool and self.selected_tool["type"] == "delete":
-            self.selected_tool = None
-            self.status_bar.config(text="Tool: None")
-        else:
-            self.selected_tool = {"type": "delete"}
-            self.status_bar.config(text="Tool: Delete Mode")
 
     def place_element(self, event):
         if not self.selected_tool:
@@ -295,6 +365,7 @@ class GridApp:
         y = GRID_SIZE - int((self.canvas.canvasy(event.y) - self.pan_y) / adjusted_cell_size) - 1
         if not (0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE):
             return
+
         if self.selected_tool["type"] == "delete":
             for center, data in list(self.placed_objects.items()):
                 obj_size = data.get("size", (3, 3))
@@ -307,26 +378,35 @@ class GridApp:
                     self.draw_grid()
                     return
             return
+
         elif self.selected_tool["type"] == "terrain":
             self.terrain_cells[(x, y)] = self.selected_tool["terrain"]
+
         elif self.selected_tool["type"] == "object":
+            # If this is a unique object (for alliance members, for example), remove any previous instance.
             if self.selected_tool.get("unique", False):
                 for center, data in list(self.placed_objects.items()):
+                    # Compare tags—ensure the tag is set uniquely for alliance member objects.
                     if data.get("tag") == self.selected_tool.get("tag"):
                         del self.placed_objects[center]
                         break
+
             obj_size = self.selected_tool.get("size", (3, 3))
             w, h = obj_size
+            # Check for collision with any other object.
             for (obj_x, obj_y), existing_obj in self.placed_objects.items():
-                if (abs(obj_x - x) < w and abs(obj_y - y) < h):
+                if abs(obj_x - x) < w and abs(obj_y - y) < h:
                     print("Cannot place object: Space occupied!")
                     return
+
+            # Place the object at the clicked cell.
             self.placed_objects[(x, y)] = {
                 "tag": self.selected_tool["tag"],
                 "color": self.selected_tool["color"],
                 "size": obj_size,
                 "avatar": self.selected_tool.get("avatar")
             }
+
         self.draw_grid()
         self.canvas.delete("shadow")
 
@@ -363,8 +443,7 @@ class GridApp:
                     compound="left",
                     command=lambda m=member: self.activate_preset_object(
                         m.get("Name", "Unnamed"),
-                        m.get("Avatar") if m.get("Avatar") and os.path.exists(m.get("Avatar"))
-                            else self.alliance_default_colors.get(m.get("Rank", "R1"), "#000000"),
+                        self.alliance_default_colors.get(m.get("Rank", "R1"), "#000000"),
                         m.get("Size", (3, 3)),
                         unique=True,
                         avatar=m.get("Avatar")
@@ -373,10 +452,15 @@ class GridApp:
                 if not hasattr(self, "alliance_member_images"):
                     self.alliance_member_images = []
                 self.alliance_member_images.append(avatar_photo)
-
+                
     def draw_grid(self):
+        # Clear the entire canvas.
         self.canvas.delete("all")
+        
+        # Redraw terrain (unchanged)
         self.redraw_terrain()
+        
+        # Draw grid lines.
         adjusted_cell_size = CELL_SIZE * self.zoom_factor
         for i in range(GRID_SIZE + 1):
             x = i * adjusted_cell_size + self.pan_x
@@ -390,7 +474,64 @@ class GridApp:
                     line_color = self.blend_color(self.minor_grid_color, self.minor_opacity)
                     self.canvas.create_line(x, self.pan_y, x, GRID_SIZE * adjusted_cell_size + self.pan_y, fill=line_color, tags="grid")
                     self.canvas.create_line(self.pan_x, y, GRID_SIZE * adjusted_cell_size + self.pan_x, y, fill=line_color, tags="grid")
+        
+        # Draw both normal objects and markers in one unified call.
         self.redraw_objects()
+
+
+    def on_marker_press(self, event):
+        items = self.canvas.find_withtag("marker")
+        for item in items:
+            coords = self.canvas.coords(item)  # [x1, y1, x2, y2]
+            if coords and coords[0] <= event.x <= coords[2] and coords[1] <= event.y <= coords[3]:
+                self.current_marker_id = None
+                for key, marker in self.markers.items():
+                    adjusted = CELL_SIZE * self.zoom_factor
+                    mx1 = marker["x1"] * adjusted + self.pan_x
+                    my1 = (GRID_SIZE - marker["y1"]) * adjusted + self.pan_y
+                    mx2 = marker["x2"] * adjusted + self.pan_x
+                    my2 = (GRID_SIZE - marker["y2"]) * adjusted + self.pan_y
+                    if abs(mx1 - coords[0]) < 5 and abs(my1 - coords[1]) < 5 and abs(mx2 - coords[2]) < 5 and abs(my2 - coords[3]) < 5:
+                        self.current_marker_id = key
+                        break
+                self.marker_move_start = (event.x, event.y)
+                if self.current_marker_id is not None:
+                    marker = self.markers[self.current_marker_id]
+                    x2 = marker["x2"] * adjusted + self.pan_x
+                    y2 = (GRID_SIZE - marker["y2"]) * adjusted + self.pan_y
+                    if abs(event.x - x2) < 10 and abs(event.y - y2) < 10:
+                        self.marker_resizing = True
+                    else:
+                        self.marker_resizing = False
+                # Prevent further propagation so that on_left_button_press doesn't run:
+                return "break"
+
+    def on_marker_motion(self, event):
+        if self.current_marker_id is None:
+            return
+        # A movement indicates dragging.
+        self.marker_dragging = True
+        dx = event.x - self.marker_move_start[0]
+        dy = event.y - self.marker_move_start[1]
+        adjusted = CELL_SIZE * self.zoom_factor
+        marker = self.markers[self.current_marker_id]
+        # Convert the pixel delta to grid units.
+        grid_dx = dx / adjusted
+        grid_dy = dy / adjusted
+        if self.marker_resizing:
+            # Resize the marker (update bottom-right corner).
+            marker["x2"] += grid_dx
+            marker["y2"] -= grid_dy  # Remember: grid y increases upward.
+        else:
+            # Move the entire marker.
+            marker["x1"] += grid_dx
+            marker["y1"] -= grid_dy
+            marker["x2"] += grid_dx
+            marker["y2"] -= grid_dy
+        self.marker_move_start = (event.x, event.y)
+        self.draw_markers()
+
+
 
     def redraw_terrain(self):
         self.canvas.delete("terrain")
@@ -410,7 +551,43 @@ class GridApp:
         self.canvas.create_image(mud_x, mud_y, image=self.textures["mud"], anchor="nw", tags="terrain")
         self.canvas.create_image(dark_mud_x, dark_mud_y, image=self.textures["dark_mud"], anchor="nw", tags="terrain")
 
+    def get_item_at(self, event):
+        """
+        Returns the key of the placed_objects entry under the mouse, or None if none.
+        This single function checks both normal objects (center-based) and markers (bbox-based).
+        """
+        adjusted_cell_size = CELL_SIZE * self.zoom_factor
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
 
+        for key, data in self.placed_objects.items():
+            if data.get("is_marker"):
+                # This is a marker, stored as a bounding box (x1, y1, x2, y2) in the grid.
+                x1, y1, x2, y2 = data["bbox"]
+                # Convert marker’s bounding box from grid coords to canvas coords.
+                c_x1 = x1 * adjusted_cell_size + self.pan_x
+                c_y1 = (GRID_SIZE - y1) * adjusted_cell_size + self.pan_y
+                c_x2 = x2 * adjusted_cell_size + self.pan_x
+                c_y2 = (GRID_SIZE - y2) * adjusted_cell_size + self.pan_y
+                # Check if mouse is within these canvas coords.
+                if c_x1 <= canvas_x <= c_x2 and c_y1 <= canvas_y <= c_y2:
+                    return key
+            else:
+                # This is a normal object, stored with a center (x, y) in the key and a size in data.
+                (obj_x, obj_y) = key  # The grid center
+                w, h = data.get("size", (3, 3))
+                # Compute the bounding box in grid coords
+                x_start = obj_x - w // 2
+                y_start = obj_y - h // 2
+                # Convert to canvas coords
+                c_x1 = x_start * adjusted_cell_size + self.pan_x
+                c_y1 = (GRID_SIZE - (y_start + h)) * adjusted_cell_size + self.pan_y
+                c_x2 = c_x1 + w * adjusted_cell_size
+                c_y2 = c_y1 + h * adjusted_cell_size
+                if c_x1 <= canvas_x <= c_x2 and c_y1 <= canvas_y <= c_y2:
+                    return key
+
+        return None  # No item found under the mouse
 
     def update_shadow(self, event):
         if self.selected_tool is None or "type" not in self.selected_tool:
@@ -465,6 +642,124 @@ class GridApp:
                 command=lambda t=tag, d=data: self.activate_preset_object(t, d["color"], d["size"])
             )
 
+    def edit_object_properties(self, old_name, category, current_color):
+        """Opens a dialog to edit a placed object's properties.
+        If no new name is entered, the old name is kept."""
+        win = tk.Toplevel(self.root)
+        win.title("Edit Object Properties")
+        win.transient(self.root)
+        win.grab_set()
+        
+        tk.Label(win, text="Object Name:").grid(row=0, column=0, padx=10, pady=5)
+        name_entry = tk.Entry(win)
+        name_entry.insert(0, old_name)
+        name_entry.grid(row=0, column=1, padx=10, pady=5)
+        
+        tk.Label(win, text="Object Color:").grid(row=1, column=0, padx=10, pady=5)
+        color_label = tk.Label(win, text=current_color, bg=current_color, width=10)
+        color_label.grid(row=1, column=1, padx=10, pady=5)
+        
+        def choose_color():
+            color = colorchooser.askcolor(title="Choose Color")[1]
+            if color:
+                color_label.config(text=color, bg=color)
+        tk.Button(win, text="Choose Color", command=choose_color).grid(row=1, column=2, padx=10, pady=5)
+        
+        def save_changes():
+            new_name = name_entry.get().strip()
+            if not new_name:
+                new_name = old_name  # If no new name, keep the old one.
+            new_color = color_label.cget("text")
+            if category == "Friendly":
+                self.friendly_objects.pop(old_name, None)
+                self.friendly_objects[new_name] = new_color
+                self.update_friendly_submenu()
+            elif category == "Enemy":
+                self.enemy_objects.pop(old_name, None)
+                self.enemy_objects[new_name] = new_color
+                self.update_enemy_submenu()
+            else:
+                self.other_objects.pop(old_name, None)
+                self.other_objects[new_name] = new_color
+                self.update_other_submenu()
+            win.destroy()
+        tk.Button(win, text="Save", command=save_changes).grid(row=2, column=0, columnspan=3, pady=10)
+        win.wait_window(win)        
+
+    def add_new_object(self, category):
+        """Opens a dialog to add a new object in the specified category."""
+        win = tk.Toplevel(self.root)
+        win.title("Add New Object")
+        win.transient(self.root)
+        win.grab_set()
+        
+        tk.Label(win, text="Object Name:").grid(row=0, column=0, padx=10, pady=5)
+        name_entry = tk.Entry(win)
+        name_entry.grid(row=0, column=1, padx=10, pady=5)
+        
+        tk.Label(win, text="Object Color:").grid(row=1, column=0, padx=10, pady=5)
+        color_label = tk.Label(win, text="", bg="white", width=10)
+        color_label.grid(row=1, column=1, padx=10, pady=5)
+        
+        def choose_color():
+            color = colorchooser.askcolor(title="Choose Color")[1]
+            if color:
+                color_label.config(text=color, bg=color)
+        tk.Button(win, text="Choose Color", command=choose_color).grid(row=1, column=2, padx=10, pady=5)
+        
+        def save_new():
+            new_name = name_entry.get().strip()
+            if not new_name:
+                messagebox.showerror("Error", "Name cannot be empty.")
+                return
+            new_color = color_label.cget("text")
+            if not new_color:
+                # Set a default color if none chosen.
+                new_color = "#FFFFFF"
+            if category == "Friendly":
+                self.friendly_objects[new_name] = new_color
+                self.update_friendly_submenu()
+            elif category == "Enemy":
+                self.enemy_objects[new_name] = new_color
+                self.update_enemy_submenu()
+            else:
+                self.other_objects[new_name] = new_color
+                self.update_other_submenu()
+            win.destroy()
+        tk.Button(win, text="Add Object", command=save_new).grid(row=2, column=0, columnspan=3, pady=10)
+        win.wait_window(win)
+
+        def save_properties():
+            new_tag = tag_entry.get().strip()
+            new_color = color_display.cget("text")
+            if not new_tag:
+                messagebox.showerror("Error", "Name cannot be empty.")
+                return
+            # Update the object properties
+            self.placed_objects[obj_center]["tag"] = new_tag
+            self.placed_objects[obj_center]["color"] = new_color
+            self.draw_grid()  # Redraw grid to update the object
+            win.destroy()
+        
+        tk.Button(win, text="Save", command=save_properties).grid(row=2, column=0, columnspan=3, pady=10)
+
+    def update_friendly_submenu(self):
+        self.friendly_submenu.delete(0, tk.END)
+        for name, color in self.friendly_objects.items():
+            self.friendly_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+
+    def update_enemy_submenu(self):
+        self.enemy_submenu.delete(0, tk.END)
+        for name, color in self.enemy_objects.items():
+            self.enemy_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+
+    def update_other_submenu(self):
+        self.other_submenu.delete(0, tk.END)
+        for name, color in self.other_objects.items():
+            self.other_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+
+
+
     def edit_object_text(self, event):
         adjusted_cell_size = CELL_SIZE * self.zoom_factor
         x = int((self.canvas.canvasx(event.x) - self.pan_x) / adjusted_cell_size)
@@ -479,6 +774,354 @@ class GridApp:
     def deselect_tool(self, event=None):
         self.selected_tool = None
         self.status_bar.config(text="Tool: None")
+
+    def show_object_context_menu(self, event, obj_center):
+        """Opens a context menu for a placed object with options to edit, change type, or delete it."""
+        context_win = tk.Toplevel(self.root)
+        context_win.title("Object Options")
+        tk.Label(context_win, text="Select an action:").pack(padx=10, pady=10)
+        
+        def delete_object():
+            if obj_center in self.placed_objects:
+                del self.placed_objects[obj_center]
+                self.draw_grid()
+            context_win.destroy()
+                
+        def edit_properties():
+            context_win.destroy()
+            self.edit_object_properties(obj_center)
+        
+        tk.Button(context_win, text="Edit Object", command=edit_properties).pack(side=tk.LEFT, padx=10, pady=10)
+        tk.Button(context_win, text="Change Type", command=change_type).pack(side=tk.LEFT, padx=10, pady=10)
+        tk.Button(context_win, text="Delete Object", command=delete_object).pack(side=tk.RIGHT, padx=10, pady=10)
+
+       
+    def add_marker(self):
+        """Opens a dialog to create a new marker and adds it to placed_objects."""
+        win = tk.Toplevel(self.root)
+        win.title("Add Marker")
+        win.transient(self.root)
+        win.grab_set()
+        
+        tk.Label(win, text="Marker Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_entry = tk.Entry(win)
+        name_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        tk.Label(win, text="Marker Color:").grid(row=1, column=0, padx=5, pady=5)
+        color_label = tk.Label(win, text="", bg="white", width=10)
+        color_label.grid(row=1, column=1, padx=5, pady=5)
+        def choose_color():
+            color = colorchooser.askcolor(title="Choose Marker Color")[1]
+            if color:
+                color_label.config(text=color, bg=color)
+        tk.Button(win, text="Choose Color", command=choose_color).grid(row=1, column=2, padx=5, pady=5)
+        
+        tk.Label(win, text="X1 (grid):").grid(row=2, column=0, padx=5, pady=5)
+        x1_entry = tk.Entry(win)
+        x1_entry.grid(row=2, column=1, padx=5, pady=5)
+        tk.Label(win, text="Y1 (grid):").grid(row=3, column=0, padx=5, pady=5)
+        y1_entry = tk.Entry(win)
+        y1_entry.grid(row=3, column=1, padx=5, pady=5)
+        tk.Label(win, text="X2 (grid):").grid(row=4, column=0, padx=5, pady=5)
+        x2_entry = tk.Entry(win)
+        x2_entry.grid(row=4, column=1, padx=5, pady=5)
+        tk.Label(win, text="Y2 (grid):").grid(row=5, column=0, padx=5, pady=5)
+        y2_entry = tk.Entry(win)
+        y2_entry.grid(row=5, column=1, padx=5, pady=5)
+        
+        def save_marker():
+            try:
+                name = name_entry.get().strip()
+                x1 = float(x1_entry.get())
+                y1 = float(y1_entry.get())
+                x2 = float(x2_entry.get())
+                y2 = float(y2_entry.get())
+            except Exception as e:
+                messagebox.showerror("Error", "Invalid coordinates")
+                return
+            color = color_label.cget("text")
+            if not name:
+                messagebox.showerror("Error", "Name cannot be empty")
+                return
+            # Use a key like ("marker", name) and store a bounding box.
+            key = ("marker", name)
+            self.placed_objects[key] = {
+                "is_marker": True,
+                "tag": name,
+                "color": color,    # This must be a valid hex color.
+                "bbox": (x1, y1, x2, y2)
+            }
+            self.draw_grid()
+            win.destroy()
+        
+        tk.Button(win, text="Save Marker", command=save_marker).grid(row=6, column=0, columnspan=3, pady=10)
+        win.wait_window(win)
+
+    def edit_marker(self, marker_key):
+        """
+        Opens a dialog to edit marker properties.
+        marker_key is a tuple of the form ("marker", marker_name)
+        """
+        marker = self.placed_objects.get(marker_key)
+        if not marker:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Edit Marker")
+        win.transient(self.root)
+        win.grab_set()
+        
+        tk.Label(win, text="Marker Name:").grid(row=0, column=0, padx=5, pady=5)
+        name_entry = tk.Entry(win)
+        name_entry.insert(0, marker["tag"])
+        name_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        tk.Label(win, text="Marker Color:").grid(row=1, column=0, padx=5, pady=5)
+        color_label = tk.Label(win, text=marker["color"], bg=marker["color"], width=10)
+        color_label.grid(row=1, column=1, padx=5, pady=5)
+        def choose_color():
+            color = colorchooser.askcolor(title="Choose Marker Color")[1]
+            if color:
+                color_label.config(text=color, bg=color)
+        tk.Button(win, text="Choose Color", command=choose_color).grid(row=1, column=2, padx=5, pady=5)
+        
+        tk.Label(win, text="X1:").grid(row=2, column=0, padx=5, pady=5)
+        x1_entry = tk.Entry(win)
+        x1_entry.insert(0, marker["bbox"][0])
+        x1_entry.grid(row=2, column=1, padx=5, pady=5)
+        tk.Label(win, text="Y1:").grid(row=3, column=0, padx=5, pady=5)
+        y1_entry = tk.Entry(win)
+        y1_entry.insert(0, marker["bbox"][1])
+        y1_entry.grid(row=3, column=1, padx=5, pady=5)
+        tk.Label(win, text="X2:").grid(row=4, column=0, padx=5, pady=5)
+        x2_entry = tk.Entry(win)
+        x2_entry.insert(0, marker["bbox"][2])
+        x2_entry.grid(row=4, column=1, padx=5, pady=5)
+        tk.Label(win, text="Y2:").grid(row=5, column=0, padx=5, pady=5)
+        y2_entry = tk.Entry(win)
+        y2_entry.insert(0, marker["bbox"][3])
+        y2_entry.grid(row=5, column=1, padx=5, pady=5)
+        
+        def save_changes():
+            try:
+                new_name = name_entry.get().strip()
+                new_x1 = float(x1_entry.get())
+                new_y1 = float(y1_entry.get())
+                new_x2 = float(x2_entry.get())
+                new_y2 = float(y2_entry.get())
+            except Exception as e:
+                messagebox.showerror("Error", "Invalid input")
+                return
+            new_color = color_label.cget("text")
+            if not new_name:
+                new_name = marker["tag"]
+            # Update marker data.
+            marker["tag"] = new_name
+            marker["color"] = new_color
+            marker["bbox"] = (new_x1, new_y1, new_x2, new_y2)
+            # If the marker name changed, update the key in placed_objects.
+            old_key = marker_key
+            new_key = ("marker", new_name)
+            if new_key != old_key:
+                del self.placed_objects[old_key]
+                self.placed_objects[new_key] = marker
+            self.draw_grid()
+            win.destroy()
+        
+        tk.Button(win, text="Save", command=save_changes).grid(row=6, column=0, columnspan=3, pady=10)
+        win.wait_window(win)
+
+    def edit_marker_prompt(self):
+        """Opens a dialog to select a marker (from placed_objects) to edit."""
+        # Gather all marker keys (which are tuples with first element "marker")
+        marker_keys = [key for key in self.placed_objects if isinstance(key, tuple) and key[0] == "marker"]
+        if not marker_keys:
+            messagebox.showinfo("Info", "No markers to edit.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Select Marker to Edit")
+        win.transient(self.root)
+        win.grab_set()
+        listbox = tk.Listbox(win)
+        listbox.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        # Insert marker names (second element of the key)
+        for key in marker_keys:
+            listbox.insert(tk.END, key[1])
+        def select_marker():
+            sel = listbox.curselection()
+            if sel:
+                marker_name = listbox.get(sel[0])
+                key = ("marker", marker_name)
+                win.destroy()
+                self.edit_marker(key)
+        tk.Button(win, text="Edit Selected Marker", command=select_marker).pack(pady=5)
+        win.wait_window(win)
+
+           
+    def remove_marker_prompt(self):
+        """Opens a dialog to select a marker (from placed_objects) to remove."""
+        # Get keys that represent markers.
+        marker_keys = [key for key in self.placed_objects if isinstance(key, tuple) and key[0] == "marker"]
+        if not marker_keys:
+            messagebox.showinfo("Info", "No markers to remove.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Remove Marker")
+        win.transient(self.root)
+        win.grab_set()
+        marker_listbox = tk.Listbox(win)
+        marker_listbox.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        for key in marker_keys:
+            # key[1] is the marker name.
+            marker_listbox.insert(tk.END, key[1])
+        def delete_marker():
+            sel = marker_listbox.curselection()
+            if sel:
+                marker_name = marker_listbox.get(sel[0])
+                key = ("marker", marker_name)
+                if key in self.placed_objects:
+                    del self.placed_objects[key]
+                    self.draw_grid()
+                    win.destroy()
+        tk.Button(win, text="Remove Selected Marker", command=delete_marker).pack(pady=5)
+        win.wait_window(win)
+
+    def activate_marker_drawing(self):
+        self.current_tool = "marker_draw"
+        self.top_right_status.config(text="Tool: Draw Marker")
+
+
+    def marker_draw_press(self, event):
+        if self.current_tool != "marker_draw":
+            return
+        # Record the initial canvas coordinates
+        self.marker_draw_start = (self.canvas.canvasx(event.x),
+                                  self.canvas.canvasy(event.y))
+        # Create the temp rectangle with a solid outline (no dash)
+        self.marker_draw_rect = self.canvas.create_rectangle(
+            self.marker_draw_start[0],
+            self.marker_draw_start[1],
+            self.marker_draw_start[0],
+            self.marker_draw_start[1],
+            outline="green",   # or any color you like
+            width=3,
+            dash=()            # empty tuple = no dash
+        )
+
+    def marker_draw_motion(self, event):
+        if self.current_tool != "marker_draw":
+            return
+        if self.marker_draw_rect is None:
+            return
+        
+        # Current mouse position in canvas coords
+        current_x = self.canvas.canvasx(event.x)
+        current_y = self.canvas.canvasy(event.y)
+        
+        # Convert both 'start' and 'current' canvas coords -> snapped grid coords
+        adjusted = CELL_SIZE * self.zoom_factor
+        
+        # Convert the start point
+        start_cx, start_cy = self.marker_draw_start
+        start_grid_x = int(round((start_cx - self.pan_x) / adjusted))
+        start_grid_y = int(round(GRID_SIZE - (start_cy - self.pan_y) / adjusted - 1))
+
+        # Convert the current drag point
+        current_grid_x = int(round((current_x - self.pan_x) / adjusted))
+        current_grid_y = int(round(GRID_SIZE - (current_y - self.pan_y) / adjusted - 1))
+        
+        # Now convert those grid coords back to canvas coords, so the rectangle
+        # is drawn exactly on integer cell boundaries.
+        c_x1 = start_grid_x * adjusted + self.pan_x
+        c_y1 = (GRID_SIZE - start_grid_y) * adjusted + self.pan_y
+        c_x2 = current_grid_x * adjusted + self.pan_x
+        c_y2 = (GRID_SIZE - current_grid_y) * adjusted + self.pan_y
+        
+        # Update the rectangle's coords to reflect snapped positions
+        self.canvas.coords(self.marker_draw_rect, c_x1, c_y1, c_x2, c_y2)
+        # Also ensure its style is solid (no dash)
+        self.canvas.itemconfig(self.marker_draw_rect, dash=(), outline="green")
+
+ 
+    def marker_draw_release(self, event):
+        if self.current_tool != "marker_draw" or self.marker_draw_rect is None:
+            return
+
+        coords = self.canvas.coords(self.marker_draw_rect)
+        self.canvas.delete(self.marker_draw_rect)
+        self.marker_draw_rect = None
+
+        # Convert the canvas coordinates to grid coordinates
+        adjusted = CELL_SIZE * self.zoom_factor
+        raw_x1 = (coords[0] - self.pan_x) / adjusted
+        raw_y1 = (coords[1] - self.pan_y) / adjusted
+        raw_x2 = (coords[2] - self.pan_x) / adjusted
+        raw_y2 = (coords[3] - self.pan_y) / adjusted
+
+        # Round and flip Y (since your grid uses (GRID_SIZE - y) in the code)
+        x1 = int(round(raw_x1))
+        y1 = int(round(GRID_SIZE - raw_y1 - 1))
+        x2 = int(round(raw_x2))
+        y2 = int(round(GRID_SIZE - raw_y2 - 1))
+
+        # Ensure x1 <= x2 and y1 <= y2
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+
+        # Compute width and height in grid cells
+        width = x2 - x1 + 1
+        height = y2 - y1 + 1
+
+        # Compute the center where to store the object
+        center_x = x1 + (width // 2)
+        center_y = y1 + (height // 2)
+
+        # Create a new normal object (instead of a "marker")
+        tag = f"Rect_{center_x}_{center_y}"
+        self.placed_objects[(center_x, center_y)] = {
+            "tag": tag,
+            "color": "gray",
+            "size": (width, height)
+        }
+
+        self.draw_grid()
+
+        # Optionally reset tool
+        self.current_tool = None
+        self.top_right_status.config(text="Tool: None")
+
+    def prompt_marker_details(self, x1, y1, x2, y2):
+        win = tk.Toplevel(self.root)
+        win.title("Define Marker")
+        win.transient(self.root)
+        win.grab_set()
+        
+        tk.Label(win, text="Marker Name:").grid(row=0, column=0, padx=10, pady=5)
+        name_entry = tk.Entry(win)
+        name_entry.grid(row=0, column=1, padx=10, pady=5)
+        
+        tk.Label(win, text="Marker Color:").grid(row=1, column=0, padx=10, pady=5)
+        color_label = tk.Label(win, text="black", bg="black", width=10)
+        color_label.grid(row=1, column=1, padx=10, pady=5)
+        def choose_color():
+            color = colorchooser.askcolor(title="Choose Marker Color")[1]
+            if color:
+                color_label.config(text=color, bg=color)
+        tk.Button(win, text="Choose Color", command=choose_color).grid(row=1, column=2, padx=10, pady=5)
+        
+        def save_marker():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Name cannot be empty.")
+                return
+            marker = {"name": name, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "color": color_label.cget("text")}
+            self.placed_objects[("marker", name)] = marker
+            self.draw_markers()
+            win.destroy()
+        tk.Button(win, text="Save Marker", command=save_marker).grid(row=2, column=0, columnspan=3, pady=10)
+        win.wait_window(win)
+
 
     # ------------------------------
     # Schedule Management
@@ -784,47 +1427,79 @@ class GridApp:
         self.redraw_terrain()
 
     def redraw_objects(self):
-        """Redraws all objects on top of the grid and terrain."""
-        self.canvas.delete("object")
-        adjusted_cell_size = CELL_SIZE * self.zoom_factor
-        for (x, y), data in self.placed_objects.items():
-            obj_size = data.get("size", (3,3))
-            w, h = obj_size
-            x_start = x - w // 2
-            y_start = y - h // 2
-            x_pos = x_start * adjusted_cell_size + self.pan_x
-            y_pos = (GRID_SIZE - (y_start + h)) * adjusted_cell_size + self.pan_y
-            if data.get("avatar") and os.path.exists(data["avatar"]):
-                try:
-                    img = Image.open(data["avatar"])
-                    # Resize the image to fit the object's cell area
-                    img = img.resize((int(w * adjusted_cell_size), int(h * adjusted_cell_size)), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(img)
-                    self.canvas.create_image(x_pos, y_pos, image=photo, anchor="nw", tags="object")
-                    # Save reference to avoid garbage collection
-                    if not hasattr(self, "object_images"):
-                        self.object_images = []
-                    self.object_images.append(photo)
-                except Exception as e:
-                    print("Error loading avatar image:", e)
-                    # Fallback to drawing rectangle
-                    self.canvas.create_rectangle(
-                        x_pos, y_pos, x_pos + w * adjusted_cell_size, y_pos + h * adjusted_cell_size,
-                        fill=data["color"], outline="black", tags="object"
-                    )
-                    self.canvas.create_text(
-                        x_pos + (w * adjusted_cell_size) / 2, y_pos + (h * adjusted_cell_size) / 2,
-                        text=data["tag"], fill="white", font=("Arial", int(adjusted_cell_size / 3)), tags="object"
-                    )
+        adjusted = CELL_SIZE * self.zoom_factor
+        
+        # Iterate over every placed object
+        for key, data in self.placed_objects.items():
+            if data.get("is_marker"):
+                # It's a marker. It stores its geometry as a bounding box.
+                x1, y1, x2, y2 = data["bbox"]
+                # Convert grid coordinates to canvas coordinates.
+                c_x1 = x1 * adjusted + self.pan_x
+                c_y1 = (GRID_SIZE - y1) * adjusted + self.pan_y
+                c_x2 = x2 * adjusted + self.pan_x
+                c_y2 = (GRID_SIZE - y2) * adjusted + self.pan_y
+                
+                # Use a blue outline if selected, otherwise use its defined color.
+                if key in self.selected_objects:
+                    outline_color = "blue"
+                    width = 4
+                    dash = (4, 2)
+                else:
+                    outline_color = data["color"]
+                    width = 4
+                    dash = None
+                
+                self.canvas.create_rectangle(c_x1, c_y1, c_x2, c_y2,
+                                             outline=outline_color, width=width, dash=dash, fill="")
+                # Optionally, display the marker's name when zoomed out.
+                if adjusted < self.grid_zoom_threshold:
+                    mid_x = (c_x1 + c_x2) / 2
+                    mid_y = (c_y1 + c_y2) / 2
+                    self.canvas.create_text(mid_x, mid_y, text=data["tag"], fill=data["color"])
             else:
-                self.canvas.create_rectangle(
-                    x_pos, y_pos, x_pos + w * adjusted_cell_size, y_pos + h * adjusted_cell_size,
-                    fill=data["color"], outline="black", tags="object"
-                )
-                self.canvas.create_text(
-                    x_pos + (w * adjusted_cell_size) / 2, y_pos + (h * adjusted_cell_size) / 2,
-                    text=data["tag"], fill="white", font=("Arial", int(adjusted_cell_size / 3)), tags="object"
-                )
+                # It's a normal object. Its key is a tuple (x, y) indicating its center, and it stores a "size".
+                (obj_x, obj_y) = key
+                w, h = data.get("size", (3, 3))
+                x_start = obj_x - w // 2
+                y_start = obj_y - h // 2
+                c_x1 = x_start * adjusted + self.pan_x
+                c_y1 = (GRID_SIZE - (y_start + h)) * adjusted + self.pan_y
+                
+                # Draw selection outline if selected.
+                if key in self.selected_objects:
+                    self.canvas.create_rectangle(c_x1, c_y1, c_x1 + w * adjusted, c_y1 + h * adjusted,
+                                                 outline="red", width=3, dash=(4, 2))
+                # If an avatar exists, attempt to draw it; otherwise draw a filled rectangle.
+                if data.get("avatar") and os.path.exists(data["avatar"]):
+                    try:
+                        img = Image.open(data["avatar"])
+                        img = img.resize((int(w * adjusted), int(h * adjusted)), Image.Resampling.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        self.canvas.create_image(c_x1, c_y1, image=photo, anchor="nw")
+                        if not hasattr(self, "object_images"):
+                            self.object_images = []
+                        self.object_images.append(photo)
+                    except Exception as e:
+                        # Fall back to a colored rectangle if the image fails.
+                        self.canvas.create_rectangle(c_x1, c_y1, c_x1 + w * adjusted, c_y1 + h * adjusted,
+                                                     fill=data["color"], outline="black")
+                        self.canvas.create_text(c_x1 + (w * adjusted) / 2, c_y1 + (h * adjusted) / 2,
+                                                 text=data["tag"], fill="white",
+                                                 font=("Arial", int(adjusted / 3)))
+                else:
+                    self.canvas.create_rectangle(c_x1, c_y1, c_x1 + w * adjusted, c_y1 + h * adjusted,
+                                                 fill=data["color"], outline="black")
+                    self.canvas.create_text(c_x1 + (w * adjusted) / 2, c_y1 + (h * adjusted) / 2,
+                                             text=data["tag"], fill="white",
+                                             font=("Arial", int(adjusted / 3)))
+
+    def delete_selected_objects(self, event):
+        for key in list(self.selected_objects):
+            if key in self.placed_objects:
+                del self.placed_objects[key]
+        self.selected_objects.clear()
+        self.draw_grid()
 
 
     def handle_right_click(self, event):
@@ -965,29 +1640,26 @@ class GridApp:
         rank_var = tk.StringVar(value="R1")
         ranks = ["R1", "R2", "R3", "R4", "R5"]
         tk.OptionMenu(add_win, rank_var, *ranks).grid(row=1, column=1, padx=5, pady=5)
-        tk.Label(add_win, text="Avatar:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        avatar_var = tk.StringVar(value="")
-        def choose_avatar():
-            file_path = filedialog.askopenfilename(initialdir="Images/avatars", title="Select Avatar Image",
-                                                   filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.gif")])
-            if file_path:
-                avatar_var.set(file_path)
-        tk.Button(add_win, text="Choose Avatar", command=choose_avatar).grid(row=2, column=1, padx=5, pady=5)
+        
         def on_add():
             name = name_var.get().strip()
             if not name:
                 tk.messagebox.showerror("Error", "Name cannot be empty.")
                 return
+            # Automatically check in the "images" folder for an image file matching the name.
+            avatar_path = self.get_alliance_avatar(name)
             new_member = {
                 "Name": name,
                 "Rank": rank_var.get(),
-                "Avatar": avatar_var.get() if avatar_var.get() else self.alliance_default_colors.get(rank_var.get(), "#000000")
+                "Avatar": avatar_path if avatar_path is not None else self.alliance_default_colors.get(rank_var.get(), "#000000")
             }
             self.alliance_members.append(new_member)
             self.alliance_members_changed = True
             self.update_member_listbox()
+            self.update_alliance_members_submenu()
             add_win.destroy()
-        tk.Button(add_win, text="Add Member", command=on_add).grid(row=3, column=0, columnspan=2, pady=10)
+        
+        tk.Button(add_win, text="Add Member", command=on_add).grid(row=2, column=0, columnspan=2, pady=10)
 
     def edit_alliance_member(self):
         if not self.alliance_members:
@@ -1027,6 +1699,7 @@ class GridApp:
             self.alliance_members[idx] = member
             self.alliance_members_changed = True
             self.update_member_listbox()
+            self.update_alliance_members_submenu()
             edit_win.destroy()
         tk.Button(edit_win, text="Save Changes", command=on_edit).grid(row=3, column=0, columnspan=2, pady=10)
 
@@ -1065,18 +1738,33 @@ class GridApp:
         self.root.config(menu=menu_bar)
         place_menu = tk.Menu(menu_bar, tearoff=0)
         menu_bar.add_cascade(label="Place Object", menu=place_menu)
+        
+        # Add an option to edit placeable objects
+        place_menu.add_command(label="Edit Placeable Objects", command=self.edit_placeable_objects)
+        
+        # Alliance submenu (if desired)
         self.create_object_submenu(place_menu, "Alliance", {
             "R1": "#2C3E50", "R2": "#34495E", "R3": "#5D6D7E", "R4": "#2874A6", "R5": "#1F618D"
         })
-        self.create_object_submenu(place_menu, "Friendly", {
-            "1": "#145A32", "2": "#1E8449", "3": "#28B463", "4": "#52BE80", "5": "#82E0AA"
-        })
-        self.create_object_submenu(place_menu, "Enemy", {
-            "1": "#922B21", "2": "#A93226", "3": "#C0392B", "4": "#E74C3C", "5": "#F1948A"
-        })
-        self.create_object_submenu(place_menu, "Other", {
-            "MG": "#FF5733"
-        })
+        
+        # Friendly submenu using stored objects:
+        self.friendly_submenu = tk.Menu(place_menu, tearoff=0)
+        place_menu.add_cascade(label="Friendly", menu=self.friendly_submenu)
+        for name, color in self.friendly_objects.items():
+            self.friendly_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+        
+        # Enemy submenu:
+        self.enemy_submenu = tk.Menu(place_menu, tearoff=0)
+        place_menu.add_cascade(label="Enemy", menu=self.enemy_submenu)
+        for name, color in self.enemy_objects.items():
+            self.enemy_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+        
+        # Other submenu:
+        self.other_submenu = tk.Menu(place_menu, tearoff=0)
+        place_menu.add_cascade(label="Other", menu=self.other_submenu)
+        for name, color in self.other_objects.items():
+            self.other_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+        
         self.custom_objects = {}
         self.custom_submenu = tk.Menu(place_menu, tearoff=0)
         place_menu.add_cascade(label="Custom", menu=self.custom_submenu)
@@ -1085,16 +1773,18 @@ class GridApp:
         self.custom_alliance_submenu = tk.Menu(place_menu, tearoff=0)
         place_menu.add_cascade(label="Alliance Members", menu=self.custom_alliance_submenu)
         self.update_alliance_members_submenu()
+        
         settings_menu = tk.Menu(menu_bar, tearoff=0)
         menu_bar.add_cascade(label="Settings", menu=settings_menu)
         settings_menu.add_command(label="Grid Properties", command=self.edit_grid_properties)
+        
         delete_menu = tk.Menu(menu_bar, tearoff=0)
-        menu_bar.add_cascade(label="🗑 Delete Mode", menu=delete_menu)
-        delete_menu.add_command(label="Toggle Delete", command=self.toggle_delete_mode)
+        
         self.coord_label = tk.Label(self.root, text="Coordinates: (0,0)", font=("Arial", 12))
         self.coord_label.pack()
         self.status_bar = tk.Label(self.root, text="Tool: None", bd=1, relief=tk.SUNKEN, anchor="w")
         self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        
         self.canvas.bind("<Motion>", self.update_coordinates)
         self.canvas.bind("<MouseWheel>", self.zoom)
         self.canvas.bind("<ButtonPress-2>", self.start_pan)
@@ -1105,20 +1795,428 @@ class GridApp:
         self.canvas.bind("<Double-1>", self.edit_object_text)
         self.canvas.bind("<Button-3>", self.handle_right_click)
         self.canvas.bind("<Motion>", self.on_mouse_move)
+
+        self.canvas.bind("<Motion>", self.on_canvas_hover, add="+")
+        
+        markers_menu = tk.Menu(menu_bar, tearoff=0)
+        menu_bar.add_cascade(label="Markers", menu=markers_menu)
+        markers_menu.add_command(label="Draw Marker", command=self.activate_marker_drawing)
+        markers_menu.add_command(label="Edit Marker", command=self.edit_marker_prompt)
+        markers_menu.add_command(label="Remove Marker", command=self.remove_marker_prompt)
+
+        
+        
         alliance_menu = tk.Menu(menu_bar, tearoff=0)
         menu_bar.add_cascade(label="Alliance Management", menu=alliance_menu)
         alliance_menu.add_command(label="Manage Members", command=self.manage_alliance_members)
         alliance_menu.add_command(label="Weekly Schedule", command=self.manage_weekly_schedule)
         tk.Button(self.root, text="Manage Predefined Tasks", command=self.manage_predefined_vs_tasks).pack(padx=10, pady=5)
-
+        
         alliance_menu.add_command(label="Create Recurring Task", command=self.create_recurring_task)
         alliance_menu.add_command(label="Add Single Task", command=self.add_single_task)
-
+        
         vs_menu = tk.Menu(alliance_menu, tearoff=0)
         alliance_menu.add_cascade(label="Manage VS Tasks", menu=vs_menu)
         vs_menu.add_command(label="Edit Predefined Tasks", command=self.manage_predefined_vs_tasks)
+        
         watermark = tk.Label(self.root, text="Powered by: MaztaPazta", font=("Arial", 10), fg="gray")
         watermark.place(relx=1.0, rely=1.0, anchor="se", x=-5, y=-5)
+
+        self.top_right_status = tk.Label(self.root, text="Tool: None", font=("Arial", 10), bg="lightgray")
+        self.top_right_status.place(relx=1.0, rely=0.0, anchor="ne", x=-5, y=5)
+
+    
+    def edit_placeable_objects(self):
+        """Opens a dialog to edit the default (placeable) objects in the Friendly or Enemy category."""
+        win = tk.Toplevel(self.root)
+        win.title("Edit Placeable Objects")
+        
+        # Category selection: Friendly or Enemy
+        tk.Label(win, text="Select Category:").grid(row=0, column=0, padx=10, pady=5)
+        category_var = tk.StringVar(value="Friendly")
+        tk.Radiobutton(win, text="Friendly", variable=category_var, value="Friendly").grid(row=0, column=1, padx=5, pady=5)
+        tk.Radiobutton(win, text="Enemy", variable=category_var, value="Enemy").grid(row=0, column=2, padx=5, pady=5)
+        
+        # Listbox to show current objects in the selected category
+        tk.Label(win, text="Select Object:").grid(row=1, column=0, padx=10, pady=5)
+        object_listbox = tk.Listbox(win, height=5)
+        object_listbox.grid(row=1, column=1, columnspan=2, padx=10, pady=5, sticky="we")
+        
+        def populate_listbox():
+            object_listbox.delete(0, tk.END)
+            cat = category_var.get()
+            if cat == "Friendly":
+                for key in self.friendly_objects.keys():
+                    object_listbox.insert(tk.END, key)
+            else:
+                for key in self.enemy_objects.keys():
+                    object_listbox.insert(tk.END, key)
+        
+        populate_listbox()
+        
+        # Update listbox when category changes
+        category_var.trace("w", lambda *args: populate_listbox())
+        
+        # Entry for new name
+        tk.Label(win, text="New Name:").grid(row=2, column=0, padx=10, pady=5)
+        name_entry = tk.Entry(win)
+        name_entry.grid(row=2, column=1, padx=10, pady=5, sticky="we")
+        
+        # Color selection
+        tk.Label(win, text="New Color:").grid(row=3, column=0, padx=10, pady=5)
+        color_label = tk.Label(win, text="", bg="white", width=10)
+        color_label.grid(row=3, column=1, padx=10, pady=5)
+        def choose_color():
+            color = colorchooser.askcolor(title="Choose Color")[1]
+            if color:
+                color_label.config(text=color, bg=color)
+        tk.Button(win, text="Choose Color", command=choose_color).grid(row=3, column=2, padx=10, pady=5)
+        
+        def save_changes():
+            selected = object_listbox.curselection()
+            if not selected:
+                messagebox.showerror("Error", "No object selected.")
+                return
+            old_key = object_listbox.get(selected[0])
+            new_key = name_entry.get().strip()
+            new_color = color_label.cget("text")
+            if not new_key:
+                messagebox.showerror("Error", "Name cannot be empty.")
+                return
+            cat = category_var.get()
+            if cat == "Friendly":
+                # Remove old key and add new key with new color
+                self.friendly_objects.pop(old_key, None)
+                self.friendly_objects[new_key] = new_color
+                self.update_friendly_submenu()
+            else:
+                self.enemy_objects.pop(old_key, None)
+                self.enemy_objects[new_key] = new_color
+                self.update_enemy_submenu()
+            win.destroy()
+        
+        tk.Button(win, text="Save Changes", command=save_changes).grid(row=4, column=0, columnspan=3, pady=10)
+
+    def update_friendly_submenu(self):
+        """Rebuilds the Friendly submenu based on self.friendly_objects."""
+        self.friendly_submenu.delete(0, tk.END)
+        for name, color in self.friendly_objects.items():
+            self.friendly_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+
+    def update_enemy_submenu(self):
+        """Rebuilds the Enemy submenu based on self.enemy_objects."""
+        self.enemy_submenu.delete(0, tk.END)
+        for name, color in self.enemy_objects.items():
+            self.enemy_submenu.add_command(label=name, command=lambda n=name, c=color: self.activate_preset_object(n, c))
+
+    def on_left_button_press(self, event):
+        if self.current_tool == "marker_draw":
+            self.marker_draw_press(event)
+        else:
+            if self.selected_tool and self.selected_tool.get("type") == "object":
+                self.place_element(event)
+
+            # Otherwise, proceed with normal selection/move/rectangle selection:
+            x = self.canvas.canvasx(event.x)
+            y = self.canvas.canvasy(event.y)
+            item_key = self.get_item_at(event)
+            if item_key is not None:
+                # (Selection / movement code here.)
+                if item_key not in self.selected_objects:
+                    self.selected_objects.clear()
+                    self.selected_objects.add(item_key)
+                    self.original_positions = {}
+                    data = self.placed_objects[item_key]
+                    if data.get("is_marker"):
+                        self.original_positions[item_key] = data["bbox"]
+                    else:
+                        self.original_positions[item_key] = item_key
+                else:
+                    if not self.original_positions:
+                        self.original_positions = {}
+                        for key in self.selected_objects:
+                            data = self.placed_objects[key]
+                            if data.get("is_marker"):
+                                self.original_positions[key] = data["bbox"]
+                            else:
+                                self.original_positions[key] = key
+                self.moving_start = (x, y)
+            else:
+                # No object was clicked – start a rectangle selection.
+                self.selected_objects.clear()
+                self.selection_start = (x, y)
+                self.selection_rect = self.canvas.create_rectangle(x, y, x, y,
+                                                                   outline="red", dash=(2,2))
+
+
+    def on_left_button_motion(self, event):
+        # If the marker-drawing tool is active, use marker_draw_motion and skip normal logic:
+        if self.current_tool == "marker_draw":
+            self.marker_draw_motion(event)
+            return  # Stop here so we don't also do selection/move code
+        
+        # Otherwise, do the normal selection/move code:
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        
+        # If we started moving an item...
+        if self.moving_start is not None:
+            dx = x - self.moving_start[0]
+            dy = y - self.moving_start[1]
+            adjusted = CELL_SIZE * self.zoom_factor
+            grid_dx = dx / adjusted
+            grid_dy = dy / adjusted
+
+            for key in list(self.selected_objects):
+                data = self.placed_objects[key]
+                original = self.original_positions[key]
+                if data.get("is_marker"):
+                    # For markers, update the bounding box
+                    x1, y1, x2, y2 = original
+                    new_bbox = (x1 + grid_dx, y1 - grid_dy, x2 + grid_dx, y2 - grid_dy)
+                    data["bbox"] = new_bbox
+                else:
+                    # For normal objects, update their center
+                    orig_x, orig_y = original
+                    new_x = orig_x + grid_dx
+                    new_y = orig_y - grid_dy
+                    new_center = (int(round(new_x)), int(round(new_y)))
+
+                    # Update placed_objects
+                    del self.placed_objects[key]
+                    self.placed_objects[new_center] = data
+                    
+                    # Update selection & original_positions
+                    self.selected_objects.remove(key)
+                    self.selected_objects.add(new_center)
+                    self.original_positions[new_center] = (new_x, new_y)
+
+            self.moving_start = (x, y)
+            self.draw_grid()
+        
+        # Else if we’re rubberbanding a rectangle for multi-selection,
+        # just update the selection rectangle’s coords.
+        elif self.selection_rect is not None:
+            self.canvas.coords(self.selection_rect,
+                               self.selection_start[0],
+                               self.selection_start[1],
+                               x, y)
+
+    def on_left_button_release(self, event):
+        if self.moving_start is not None:
+            # Movement finished; clear moving variables.
+            self.moving_start = None
+            self.original_positions.clear()
+        elif self.selection_rect is not None:
+            # Finalize rectangle selection.
+            x1, y1, x2, y2 = self.canvas.coords(self.selection_rect)
+            # Normalize coordinates.
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if y1 > y2:
+                y1, y2 = y2, y1
+            adjusted = CELL_SIZE * self.zoom_factor
+            selected_keys = []
+            for key, data in self.placed_objects.items():
+                if data.get("is_marker"):
+                    # For markers, get canvas coordinates from the bounding box.
+                    bx1, by1, bx2, by2 = data["bbox"]
+                    c_bx1 = bx1 * adjusted + self.pan_x
+                    c_by1 = (GRID_SIZE - by1) * adjusted + self.pan_y
+                    c_bx2 = bx2 * adjusted + self.pan_x
+                    c_by2 = (GRID_SIZE - by2) * adjusted + self.pan_y
+                    # If the marker’s entire rectangle lies within the selection rectangle, select it.
+                    if c_bx1 >= x1 and c_by1 >= y1 and c_bx2 <= x2 and c_by2 <= y2:
+                        selected_keys.append(key)
+                else:
+                    # For normal objects, key is the center; compute the object's canvas bounding box.
+                    obj_x, obj_y = key
+                    w, h = data.get("size", (3, 3))
+                    x_start = obj_x - w // 2
+                    y_start = obj_y - h // 2
+                    c_x1 = x_start * adjusted + self.pan_x
+                    c_y1 = (GRID_SIZE - (y_start + h)) * adjusted + self.pan_y
+                    c_x2 = c_x1 + w * adjusted
+                    c_y2 = c_y1 + h * adjusted
+                    if c_x1 >= x1 and c_y1 >= y1 and c_x2 <= x2 and c_y2 <= y2:
+                        selected_keys.append(key)
+            self.selected_objects = set(selected_keys)
+            self.canvas.delete(self.selection_rect)
+            self.selection_rect = None
+            self.draw_grid()
+
+    def get_marker_nearby(self, event, tolerance=10):
+        """Return the marker dict if the mouse is within tolerance pixels of a marker's rectangle; otherwise None."""
+        adjusted = CELL_SIZE * self.zoom_factor
+        for marker in self.markers.values():
+            x1 = marker["x1"] * adjusted + self.pan_x
+            y1 = (GRID_SIZE - marker["y1"]) * adjusted + self.pan_y
+            x2 = marker["x2"] * adjusted + self.pan_x
+            y2 = (GRID_SIZE - marker["y2"]) * adjusted + self.pan_y
+            # Expand the rectangle by tolerance on all sides.
+            if (x1 - tolerance) <= event.x <= (x2 + tolerance) and (y1 - tolerance) <= event.y <= (y2 + tolerance):
+                return marker
+        return None
+
+    def on_marker_press(self, event):
+        # Get the top item under the pointer using the "current" tag.
+        current_items = self.canvas.find_withtag("current")
+        for item in current_items:
+            tags = self.canvas.gettags(item)
+            for tag in tags:
+                if tag.startswith("marker_"):
+                    # Extract the marker's unique ID (its name)
+                    marker_id = tag.split("_", 1)[1]
+                    self.current_marker_id = marker_id
+                    self.marker_move_start = (event.x, event.y)
+                    adjusted = CELL_SIZE * self.zoom_factor
+                    marker = self.markers[self.current_marker_id]
+                    # Check if the click is near the bottom-right corner (for resizing)
+                    x2 = marker["x2"] * adjusted + self.pan_x
+                    y2 = (GRID_SIZE - marker["y2"]) * adjusted + self.pan_y
+                    if abs(event.x - x2) < 10 and abs(event.y - y2) < 10:
+                        self.marker_resizing = True
+                    else:
+                        self.marker_resizing = False
+                    self.marker_dragging = False  # Reset dragging flag on press.
+                    return "break"
+                    
+    def get_object_info(self, event):
+        """
+        Returns a string with information about the object (or marker) under the cursor.
+        Checks markers first, then placed objects.
+        """
+        marker = self.get_marker_nearby(event, tolerance=10)
+        if marker:
+            return f"Marker: {marker['name']}\nCoords: {marker['x1']},{marker['y1']} - {marker['x2']},{marker['y2']}\nColor: {marker['color']}"
+        obj_key = self.get_object_at(event)
+        if obj_key:
+            data = self.placed_objects.get(obj_key)
+            if data:
+                return f"Object: {data.get('tag', 'Unnamed')}\nColor: {data.get('color', 'N/A')}"
+        return None
+
+    def show_tooltip(self, text, x, y):
+        # If a tooltip already exists with the same text, just update its position.
+        if hasattr(self, 'tooltip') and self.tooltip is not None:
+            current_text = self.tooltip_label.cget("text") if hasattr(self, 'tooltip_label') else ""
+            if current_text == text:
+                self.tooltip.wm_geometry(f"+{x+20}+{y+20}")
+                return
+            else:
+                self.tooltip.destroy()
+                self.tooltip = None
+        # Create a new tooltip
+        self.tooltip = tk.Toplevel(self.root)
+        self.tooltip.wm_overrideredirect(True)  # Remove window decorations.
+        self.tooltip.wm_geometry(f"+{x+20}+{y+20}")
+        self.tooltip_label = tk.Label(self.tooltip, text=text, background="yellow",
+                                      relief="solid", borderwidth=1, font=("Arial", 10))
+        self.tooltip_label.pack(ipadx=1)
+
+    def hide_tooltip(self):
+        if hasattr(self, 'tooltip') and self.tooltip is not None:
+            self.tooltip.destroy()
+            self.tooltip = None
+
+    def on_canvas_hover(self, event):
+        # Check if the mouse is over the tooltip; if so, do nothing.
+        if hasattr(self, 'tooltip') and self.tooltip is not None:
+            tx = self.tooltip.winfo_rootx()
+            ty = self.tooltip.winfo_rooty()
+            tw = self.tooltip.winfo_width()
+            th = self.tooltip.winfo_height()
+            if tx <= event.x_root <= tx + tw and ty <= event.y_root <= ty + th:
+                return
+        info = self.get_object_info(event)
+        if info:
+            self.show_tooltip(info, event.x_root, event.y_root)
+        else:
+            self.hide_tooltip()
+
+
+    def marker_draw_cancel(self, event):
+        if self.current_tool == "marker_draw":
+            if self.marker_draw_rect is not None:
+                self.canvas.delete(self.marker_draw_rect)
+                self.marker_draw_rect = None
+            self.current_tool = None
+            self.top_right_status.config(text="Tool: None")
+
+
+    def handle_right_click(self, event):
+        # If the marker drawing tool is active, cancel marker drawing.
+        if self.current_tool == "marker_draw":
+            self.marker_draw_cancel(event)
+            return "break"
+
+        # If any objects are currently selected, clear the selection and redraw.
+        if self.selected_objects:
+            self.selected_objects.clear()
+            self.draw_grid()
+            return "break"
+
+        # Otherwise, check if a placed object was right-clicked.
+        adjusted = CELL_SIZE * self.zoom_factor
+        x = int((self.canvas.canvasx(event.x) - self.pan_x) / adjusted)
+        y = GRID_SIZE - int((self.canvas.canvasy(event.y) - self.pan_y) / adjusted) - 1
+
+        found_obj = None
+        for center, data in self.placed_objects.items():
+            w, h = data.get("size", (3, 3))
+            cx, cy = center
+            x_start = cx - w // 2
+            y_start = cy - h // 2
+            if x_start <= x < x_start + w and y_start <= y < y_start + h:
+                found_obj = center
+                break
+
+        if found_obj is not None:
+            self.show_object_context_menu(event, found_obj)
+            return "break"
+        else:
+            self.deselect_tool(event)
+            return "break"
+
+    def get_alliance_avatar(self, name):
+        """Checks the 'images' folder for an image file with the same name as the member.
+        Tries common image extensions. Returns the file path if found, or None otherwise."""
+        extensions = [".png", ".jpg", ".jpeg", ".gif"]
+        for ext in extensions:
+            path = os.path.join("images", name + ext)
+            if os.path.exists(path):
+                return path
+        return None
+
+
+    def get_object_at(self, event):
+        """Return the key (x, y) of the object under the mouse, or None if none."""
+        adjusted = CELL_SIZE * self.zoom_factor
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        grid_x = int((canvas_x - self.pan_x) / adjusted)
+        grid_y = GRID_SIZE - int((canvas_y - self.pan_y) / adjusted) - 1
+        for (obj_x, obj_y), data in self.placed_objects.items():
+            w, h = data.get("size", (3,3))
+            x_start = obj_x - w // 2
+            y_start = obj_y - h // 2
+            if x_start <= grid_x < x_start + w and y_start <= grid_y < y_start + h:
+                return (obj_x, obj_y)
+        return None
+        
+    def delete_selected_objects(self, event):
+        # Delete placed objects.
+        for key in list(self.selected_objects):
+            if key in self.placed_objects:
+                del self.placed_objects[key]
+        # Delete selected markers.
+        for marker_id in list(self.selected_markers):
+            if marker_id in self.markers:
+                del self.markers[marker_id]
+        self.selected_objects.clear()
+        self.selected_markers.clear()
+        self.draw_grid()
+
 
     def deselect_tool(self, event=None):
         self.selected_tool = None
@@ -1133,17 +2231,20 @@ class GridApp:
     def set_window_title(self, window, base_title):
         window.title(f"{base_title}   Powered by: MaztaPazta")
 
-    def activate_preset_object(self, tag, color, size=(3,3), unique=False, avatar=None):
+    def activate_preset_object(self, name, color, size=(3, 3), unique=False, avatar=None):
+        # Instead of placing the object immediately,
+        # set the selected tool so that the next click on the grid
+        # will place the object.
         self.selected_tool = {
-            "type": "object",
-            "tag": tag,
+            "tag": name,
             "color": color,
             "size": size,
-            "unique": unique,
-            "avatar": avatar
+            "avatar": avatar,
+            "type": "object",
+            "unique": unique
         }
-        self.status_bar.config(text=f"Tool: Object ({tag})")
-
+        self.status_bar.config(text=f"Tool: {name}")
+        
     def activate_terrain(self, terrain_type):
         self.selected_tool = {"type": "terrain", "terrain": terrain_type}
         self.status_bar.config(text=f"Tool: Terrain ({terrain_type})")
